@@ -6,6 +6,7 @@ import ssl
 from traceback import print_exception
 from urllib import quote_plus as urlencode
 
+DEBUG = False
 
 DEFAULT_TIMEOUT = 5
 DEFUALT_BUFFER_SIZE = 2048
@@ -31,7 +32,7 @@ IE_HEADERS = {
 }
 
 EMAIL_REGEX = re.compile(
-    r'[a-z0-9\.\-+_]+@[a-z0-9\.\-+_]+\.[a-z]+'
+    r'[a-z0-9\.\-+_]+@[a-z0-9\.\-+_]+\.[a-z]+',
 )
 URL_REGEX = re.compile(
     r'(?:(?P<scheme>[a-zA-Z0-9.\-+]+)\:\/\/)?' + \
@@ -46,7 +47,7 @@ URL_REGEX = re.compile(
 )
 HTTP_RESPONSE_REGEX = re.compile(
     r'(?P<http_version>[a-zA-Z]+\/[0-2]\.[0-9])\s' + \
-    r'(?P<status_code>\d{3})\s' + \
+    r'(?P<status>\d{3})\s' + \
     r'(?P<status_reason>[\w ]+)' + \
     r'\r\n' + \
     r'(?P<headers>(?:[\w=:;.,/\-\\()\<\"> ]+\r\n)*)?' + \
@@ -57,8 +58,6 @@ HTTP_RESPONSE_REGEX = re.compile(
 
 
 class UserAgent(object):
-    debug = False
-
     def __init__(self, method, address, *args, **kwargs):
         self.method = method
         self.url = URL(address)
@@ -71,72 +70,26 @@ class UserAgent(object):
         if kwargs.get('ie_headers', False):
             self.headers.update(IE_HEADERS)
         
-        if kwargs.get('debug'):
-            self.debug = kwargs.get('debug')
-    
     def SendRequest(self):
-        parameters = ''
-        if self.parameters:
-            pairs = []
-            for key, value in self.parameters.items():
-                pairs.append(urlencode(key) + '=' + urlencode(value))
-            parameters = '&'.join(pairs)
-            self.headers['Connection'] = DEFAULT_CONNECTION_TYPE                
-            self.headers['Content-Type'] = DEFAULT_CONTENT_TYPE   
-            self.headers['Content-Length'] = str(len(parameters)) 
-        
-        headers = ''
-        if self.headers:
-            pairs = []
-            for key, value in self.headers.items():
-                pairs.append('{}: {}'.format(key, value))
-            headers = '\r\n'.join(pairs)
-
-        request = '{} {} {}'.format(
-            self.method, self.url.path, self.http_version)
-        request += '\r\n'
-        request += headers
-        request += '\r\n\r\n'
-        if parameters:
-            request += parameters
-        
-        response = ''
         with Connection(self.url.addr, secure=self.url.is_secure) as c:
-            if self.debug:
-                print("#" * 120); print(request); print("#" * 120)
-            c.Send(request)
-            response = c.Receive()
-            if self.debug:
-                print("#" * 120); print(response); print("#" * 120)
-        return self.ParseResponse(response)
-    
-    def ParseResponse(self, response):
-        response = HTTP_RESPONSE_REGEX.match(response).groupdict()
-
-        status_code = response.get('status_code')
-        message = response.get('message')
-        headers = response.get('headers').strip().split('\r\n') 
-        headers = [h.split(': ', 1) for h in headers]
-        headers = {h[0]:h[1] for h in headers}
+            request = Request(self)
+            c.Send(request.request)
+            data = c.Receive()
+            response = Response(data)
+            if response.is_3xx():
+                new_address = response.headers.get('Location')
+                if new_address:
+                    self.url = URL(new_address)
+                    return self.SendRequest()
+            return response
         
-        if status_code.startswith('3'):
-            new_address = headers.get('Location')
-            if new_address:
-                self.url = URL(new_address)
-                self.headers['Host'] = self.url.host
-                self.SendRequest()
-            else:
-                return (status_code, headers, message)
-        else:        
-            return (status_code, headers, message)
-        
-    def GetSoup(self, parser=None):
-        status_code, headers, message = self.SendRequest()
-        if message: 
-            soup = bs4.BeautifulSoup(message, 'html.parser', from_encoding='iso-8859-1')
-            return parser(soup) if parser else soup                   
-        else:
-            return ''
+    # def GetSoup(self, parser=None):
+    #     response = self.SendRequest()
+    #     if message: 
+    #         soup = bs4.BeautifulSoup(message, 'html.parser', from_encoding='iso-8859-1')
+    #         return parser(soup) if parser else soup                   
+    #     else:
+    #         return ''
 
 
 class URL(object):
@@ -184,6 +137,66 @@ class URL(object):
     @property
     def is_secure(self):
         return ((self.scheme == 'https') or (self.port == 443))
+
+
+class Request(object):
+    def __init__(self, ua):
+        self.headers = ua.headers
+        self.headers['Host'] = ua.url.host
+        self.parameters = ua.parameters
+
+        parameters = ''
+        if self.parameters:
+            pairs = []
+            for key, value in self.parameters.items():
+                pairs.append(urlencode(key) + '=' + urlencode(value))
+            parameters = '&'.join(pairs)
+        
+        if parameters:
+            self.headers['Connection'] = DEFAULT_CONNECTION_TYPE                
+            self.headers['Content-Type'] = DEFAULT_CONTENT_TYPE   
+            self.headers['Content-Length'] = str(len(parameters)) 
+        
+        headers = ''
+        if self.headers:
+            pairs = []
+            for key, value in self.headers.items():
+                pairs.append('{}: {}'.format(key, value))
+            headers = '\r\n'.join(pairs)
+
+        self.request = '{} {} {}'.format(
+            ua.method, ua.url.path, ua.http_version)
+        self.request += '\r\n'
+        self.request += headers
+        self.request += '\r\n\r\n'
+        self.request += parameters
+        if DEBUG:
+            print("#" * 120); print(self.request); print("#" * 120)
+
+
+class Response(object):  
+    def __init__(self, data):
+        if DEBUG:
+            print("#" * 120); print(data); print("#" * 120)
+
+        response = HTTP_RESPONSE_REGEX.match(data).groupdict()
+        self.status = response.get('status') #or ''
+        self.message = response.get('message') #or ''
+        self.headers = {}
+
+        headers = response.get('headers') or ''
+        for h in headers.strip().split('\r\n'):
+            header = h.split(': ', 1)
+            self.headers[str(header[0])] = str(header[1])
+        
+    def is_2xx(self):
+        return self.status.startswith('2')
+    def is_3xx(self):
+        return self.status.startswith('3')
+    def is_4xx(self):
+        return self.status.startswith('4')
+    def is_5xx(self):
+        return self.status.startswith('5')
 
 
 class Connection(object):
@@ -249,5 +262,5 @@ class Connection(object):
 
 
 if __name__ == '__main__':
-    ua = UserAgent('GET', 'http://gccis.rit.edu/', debug=True)    
+    ua = UserAgent('GET', 'http://gccis.rit.edu/')    
     ua.SendRequest()
